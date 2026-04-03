@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/conversation"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -89,6 +91,9 @@ type Service struct {
 
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
+
+	// conversationLoggerCloser holds the conversation logger for clean shutdown.
+	conversationLoggerCloser interface{ Close() error }
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -523,6 +528,20 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// legacy clients removed; no caches to refresh
 
+	// Initialize conversation logger if enabled
+	if s.cfg.ConversationLog.Enabled {
+		cl, err := conversation.NewConversationLogger(s.cfg.ConversationLog)
+		if err != nil {
+			log.Warnf("failed to initialize conversation logger: %v", err)
+		} else {
+			s.conversationLoggerCloser = cl
+			s.serverOptions = append(s.serverOptions, api.WithRequestLoggerFactory(
+				func(_ *config.Config, _ string) logging.RequestLogger { return cl },
+			))
+			log.Infof("conversation logger enabled (DSN configured)")
+		}
+	}
+
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
 
@@ -754,6 +773,12 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		// no legacy clients to persist
+
+		if s.conversationLoggerCloser != nil {
+			if err := s.conversationLoggerCloser.Close(); err != nil {
+				log.Errorf("error closing conversation logger: %v", err)
+			}
+		}
 
 		if s.server != nil {
 			shutdownCtx, cancel := context.WithTimeout(ctx, 30*time.Second)

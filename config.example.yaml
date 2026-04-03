@@ -376,3 +376,36 @@ nonstream-keepalive-interval: 0
 #       params: # JSON paths (gjson/sjson syntax) to remove from the payload
 #         - "generationConfig.thinkingConfig.thinkingBudget"
 #         - "generationConfig.responseJsonSchema"
+
+# Conversation logging to PostgreSQL.
+# Records OpenAI Chat Completions request/response data with message deduplication
+# for session reconstruction. Extensible to other API types in the future.
+# conversation-log:
+#   # Enable conversation logging (default: false)
+#   enabled: false
+#
+#   # PostgreSQL connection string (required when enabled).
+#   # Falls back to PGSTORE_DSN environment variable if not set.
+#   # Format: postgres://user:password@host:port/database?sslmode=disable
+#   dsn: ""
+#
+#   # Database schema for conversation tables (default: "public")
+#   schema: "public"
+#
+#   # Whether to log full request bodies in request_log table (default: true)
+#   log-request-body: true
+#
+#   # Whether to log full response bodies in request_log table (default: true)
+#   log-response-body: true
+#
+#   # Maximum body size in bytes before truncation (default: 1048576 = 1MB)
+#   max-body-size: 1048576
+#
+#   # Exclude specific models from logging (supports wildcards: *, prefix*, *suffix, *substring*)
+#   # exclude-models:
+#   #   - "gpt-3.5-*"
+#   #   - "*-mini"
+#
+#   # Exclude specific URL paths from logging (substring match)
+#   # exclude-paths:
+#   #   - "/v1/models"

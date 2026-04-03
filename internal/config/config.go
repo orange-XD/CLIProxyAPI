@@ -126,6 +126,11 @@ type Config struct {
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
+	// ConversationLog configures PostgreSQL-based conversation logging with message deduplication.
+	// When enabled, OpenAI Chat Completions (and future API types) request/response data is
+	// recorded to PostgreSQL for session restoration and analysis.
+	ConversationLog ConversationLogConfig `yaml:"conversation-log" json:"conversation-log"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 
@@ -311,6 +316,40 @@ type PayloadModelRule struct {
 	Name string `yaml:"name" json:"name"`
 	// Protocol restricts the rule to a specific translator format (e.g., "gemini", "responses").
 	Protocol string `yaml:"protocol" json:"protocol"`
+}
+
+// ConversationLogConfig configures PostgreSQL-based conversation logging with message deduplication.
+// When enabled, request/response data for supported API types is recorded to PostgreSQL,
+// allowing conversations to be reconstructed and restored across sessions.
+type ConversationLogConfig struct {
+	// Enabled toggles conversation logging on or off.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// DSN is the PostgreSQL connection string (e.g., "postgres://user:pass@localhost:5432/dbname").
+	// Falls back to PGSTORE_DSN environment variable if empty.
+	DSN string `yaml:"dsn,omitempty" json:"dsn,omitempty"`
+
+	// Schema is the PostgreSQL schema to use for conversation tables. Defaults to "public".
+	Schema string `yaml:"schema,omitempty" json:"schema,omitempty"`
+
+	// LogRequestBody controls whether the full request body is stored in request_log.
+	// Defaults to true.
+	LogRequestBody bool `yaml:"log-request-body" json:"log-request-body"`
+
+	// LogResponseBody controls whether the full response body is stored in request_log.
+	// Defaults to true.
+	LogResponseBody bool `yaml:"log-response-body" json:"log-response-body"`
+
+	// MaxBodySize limits the maximum body size (in bytes) to store. Bodies exceeding this
+	// limit are truncated. Defaults to 1 MB (1048576). Set to 0 for unlimited.
+	MaxBodySize int `yaml:"max-body-size,omitempty" json:"max-body-size,omitempty"`
+
+	// ExcludeModels is a list of model name patterns to exclude from conversation logging.
+	// Supports exact match and wildcard patterns (e.g., "gpt-3.5-*").
+	ExcludeModels []string `yaml:"exclude-models,omitempty" json:"exclude-models,omitempty"`
+
+	// ExcludePaths is a list of URL path patterns to exclude from conversation logging.
+	ExcludePaths []string `yaml:"exclude-paths,omitempty" json:"exclude-paths,omitempty"`
 }
 
 // CloakConfig configures request cloaking for non-Claude-Code clients.
@@ -581,6 +620,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
+	cfg.ConversationLog.LogRequestBody = true
+	cfg.ConversationLog.LogResponseBody = true
+	cfg.ConversationLog.MaxBodySize = 1048576 // 1 MB
+	cfg.ConversationLog.Schema = "public"
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.

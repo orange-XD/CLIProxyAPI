@@ -1,0 +1,458 @@
+package conversation
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	log "github.com/sirupsen/logrus"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+// ConversationLogger implements the RequestLogger interface for PostgreSQL-based
+// conversation logging with message deduplication.
+type ConversationLogger struct {
+	cfg      config.ConversationLogConfig
+	db       *sql.DB
+	schema   string
+	registry *ParserRegistry
+	enabled  bool
+	mu       sync.RWMutex
+
+	// writeQueue is a buffered channel for async database writes.
+	writeQueue chan writeOp
+	wg         sync.WaitGroup
+	cancel     context.CancelFunc
+}
+
+var _ logging.RequestLogger = (*ConversationLogger)(nil)
+var _ logging.StreamingLogWriter = (*ConversationStreamWriter)(nil)
+
+// writeOp represents an asynchronous database write operation.
+type writeOp struct {
+	fn   func(ctx context.Context) error
+	done chan error
+}
+
+// NewConversationLogger creates a new ConversationLogger.
+// It connects to PostgreSQL, ensures schema, and starts the async write worker.
+func NewConversationLogger(cfg config.ConversationLogConfig) (*ConversationLogger, error) {
+	dsn := strings.TrimSpace(cfg.DSN)
+	if dsn == "" {
+		dsn = strings.TrimSpace(os.Getenv("PGSTORE_DSN"))
+	}
+	if dsn == "" {
+		return nil, fmt.Errorf("conversation: DSN is required (set conversation-log.dsn or PGSTORE_DSN env)")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("conversation: open database: %w", err)
+	}
+	if err = db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("conversation: ping database: %w", err)
+	}
+
+	// Set connection pool defaults
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(30 * time.Minute)
+
+	schema := strings.TrimSpace(cfg.Schema)
+	if schema == "" {
+		schema = "public"
+	}
+
+	if err = EnsureSchema(ctx, db, schema); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("conversation: ensure schema: %w", err)
+	}
+
+	logger := &ConversationLogger{
+		cfg:        cfg,
+		db:         db,
+		schema:     schema,
+		registry:   NewParserRegistry(),
+		enabled:    true,
+		writeQueue: make(chan writeOp, 256),
+	}
+	// Start async write worker
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	logger.cancel = workerCancel
+	logger.wg.Add(1)
+
+	go logger.writeWorker(workerCtx)
+
+	log.Infof("conversation logger initialized (schema=%s)", schema)
+	return logger, nil
+}
+
+// writeWorker processes async database writes from the queue.
+func (l *ConversationLogger) writeWorker(ctx context.Context) {
+	defer l.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case op := <-l.writeQueue:
+			writeErr := op.fn(ctx)
+			if writeErr != nil {
+				log.Debugf("conversation: async write error: %v", writeErr)
+			}
+			if op.done != nil {
+				op.done <- writeErr
+			}
+		}
+	}
+}
+
+// enqueueWrite adds a write operation to the async queue.
+func (l *ConversationLogger) enqueueWrite(fn func(ctx context.Context) error) {
+	select {
+	case l.writeQueue <- writeOp{fn: fn}:
+	default:
+		log.Debug("conversation: write queue full, dropping operation")
+	}
+}
+
+// Close shuts down the logger, draining pending writes and closing the DB connection.
+func (l *ConversationLogger) Close() error {
+	if l.cancel != nil {
+		l.cancel()
+	}
+	l.wg.Wait()
+	if l.db != nil {
+		return l.db.Close()
+	}
+	return nil
+}
+
+// SetEnabled dynamically enables or disables conversation logging.
+func (l *ConversationLogger) SetEnabled(enabled bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.enabled = enabled
+}
+
+// IsEnabled returns whether conversation logging is currently active.
+func (l *ConversationLogger) IsEnabled() bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.enabled
+}
+
+// IsEnabled implements the RequestLogger interface.
+func (l *ConversationLogger) LogRequest(
+	url, method string,
+	requestHeaders map[string][]string,
+	body []byte,
+	statusCode int,
+	responseHeaders map[string][]string,
+	response, websocketTimeline, apiRequest, apiResponse, apiWebsocketTimeline []byte,
+	apiResponseErrors []*interfaces.ErrorMessage,
+	requestID string,
+	requestTimestamp, apiResponseTimestamp time.Time,
+) error {
+	if !l.IsEnabled() {
+		return nil
+	}
+
+	// Find matching parser
+	parser := l.registry.FindParser(url)
+	if parser == nil {
+		return nil // Not a conversation-type endpoint
+	}
+
+	// Parse request
+	parsed := parser.ParseRequest(body)
+	if parsed == nil || parsed.ConversationKey == "" {
+		return nil
+	}
+
+	// Check model exclusion
+	if l.isModelExcluded(parsed.Model) {
+		return nil
+	}
+
+	// Truncate bodies if needed
+	reqBody := body
+	respBody := response
+	if !l.cfg.LogRequestBody {
+		reqBody = nil
+	}
+	if !l.cfg.LogResponseBody {
+		respBody = nil
+	}
+	reqBody = l.truncateBody(reqBody)
+	respBody = l.truncateBody(respBody)
+
+	// Parse response messages
+	var responseMessages []UnifiedMessage
+	if len(apiResponse) > 0 {
+		responseMessages = parser.ParseResponse(apiResponse)
+	} else if len(response) > 0 {
+		responseMessages = parser.ParseResponse(response)
+	}
+
+	// Calculate duration
+	durationMs := int64(0)
+	if !apiResponseTimestamp.IsZero() && !requestTimestamp.IsZero() {
+		durationMs = apiResponseTimestamp.Sub(requestTimestamp).Milliseconds()
+	}
+
+	// Enqueue async write
+	l.enqueueWrite(func(ctx context.Context) error {
+		return l.writeConversation(ctx, parsed, reqBody, respBody, method, url, statusCode, requestID, durationMs, responseMessages)
+	})
+
+	return nil
+}
+
+// LogStreamingRequest initiates logging for a streaming request and returns a StreamingLogWriter.
+func (l *ConversationLogger) LogStreamingRequest(
+	url, method string,
+	headers map[string][]string,
+	body []byte,
+	requestID string,
+) (logging.StreamingLogWriter, error) {
+	if !l.IsEnabled() {
+		return nil, nil
+	}
+
+	parser := l.registry.FindParser(url)
+	if parser == nil {
+		return nil, nil
+	}
+
+	parsed := parser.ParseRequest(body)
+	if parsed == nil || parsed.ConversationKey == "" {
+		return nil, nil
+	}
+
+	if l.isModelExcluded(parsed.Model) {
+		return nil, nil
+	}
+
+	reqBody := body
+	if !l.cfg.LogRequestBody {
+		reqBody = nil
+	}
+	reqBody = l.truncateBody(reqBody)
+
+	writer := &ConversationStreamWriter{
+		logger:    l,
+		parser:    parser,
+		parsed:    parsed,
+		reqBody:   reqBody,
+		method:    method,
+		url:       url,
+		requestID: requestID,
+		startTime: time.Now(),
+		chunks:    make([][]byte, 0, 64),
+	}
+
+	return writer, nil
+}
+
+// writeConversation persists a complete conversation turn to the database.
+func (l *ConversationLogger) writeConversation(
+	ctx context.Context,
+	parsed *ParsedRequest,
+	reqBody, respBody []byte,
+	method, url string,
+	statusCode int,
+	requestID string,
+	durationMs int64,
+	responseMessages []UnifiedMessage,
+) error {
+	// Upsert conversation
+	conversationID, err := l.upsertConversation(ctx, parsed)
+	if err != nil {
+		return fmt.Errorf("upsert conversation: %w", err)
+	}
+
+	// Insert request messages (with deduplication)
+	if err := l.insertMessages(ctx, conversationID, parsed.Messages); err != nil {
+		log.Debugf("conversation: insert request messages: %v", err)
+	}
+
+	// Insert response messages (with deduplication)
+	if len(responseMessages) > 0 {
+		// Re-index response messages starting after the last request message
+		offset := len(parsed.Messages)
+		for i := range responseMessages {
+			responseMessages[i].MsgIndex = offset + i
+		}
+		if err := l.insertMessages(ctx, conversationID, responseMessages); err != nil {
+			log.Debugf("conversation: insert response messages: %v", err)
+		}
+	}
+
+	// Insert request log
+	if err := l.insertRequestLog(ctx, conversationID, reqBody, respBody, method, url, statusCode, parsed, requestID, durationMs); err != nil {
+		log.Debugf("conversation: insert request log: %v", err)
+	}
+
+	return nil
+}
+
+// upsertConversation creates or retrieves a conversation by conversation_key.
+func (l *ConversationLogger) upsertConversation(ctx context.Context, parsed *ParsedRequest) (string, error) {
+	table := quoteID(l.schema) + ".conversation"
+
+	var id string
+	err := l.db.QueryRowContext(ctx, fmt.Sprintf(`
+		INSERT INTO %s (conversation_key, model, api_type, updated_at, message_count)
+		VALUES ($1, $2, $3, NOW(), $4)
+		ON CONFLICT (conversation_key) DO UPDATE SET
+			model = EXCLUDED.model,
+			updated_at = NOW(),
+			message_count = EXCLUDED.message_count
+		RETURNING id
+	`, table), parsed.ConversationKey, parsed.Model, parsed.APIType, len(parsed.Messages)).Scan(&id)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// insertMessages inserts messages with ON CONFLICT DO NOTHING for deduplication.
+func (l *ConversationLogger) insertMessages(ctx context.Context, conversationID string, messages []UnifiedMessage) error {
+	if len(messages) == 0 {
+		return nil
+	}
+
+	table := quoteID(l.schema) + ".conversation_message"
+
+	// Prepare content_json for complex content
+	for _, msg := range messages {
+		contentJSON := ""
+		if len(msg.ContentParts) > 0 {
+			if data, err := json.Marshal(msg.ContentParts); err == nil {
+				contentJSON = string(data)
+			}
+		}
+
+		toolCallsJSON := ""
+		if len(msg.ToolCalls) > 0 {
+			if data, err := json.Marshal(msg.ToolCalls); err == nil {
+				toolCallsJSON = string(data)
+			}
+		}
+
+		_, err := l.db.ExecContext(ctx, fmt.Sprintf(`
+			INSERT INTO %s (conversation_id, msg_index, source, role, content, content_json, tool_calls_json, tool_call_id, name)
+			VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''))
+			ON CONFLICT (conversation_id, msg_index, source) DO NOTHING
+		`, table),
+			conversationID, msg.MsgIndex, msg.Source, string(msg.Role),
+			msg.Content, contentJSON, toolCallsJSON, msg.ToolCallID, msg.Name,
+		)
+		if err != nil {
+			log.Debugf("conversation: insert message idx=%d role=%s: %v", msg.MsgIndex, msg.Role, err)
+		}
+	}
+
+	return nil
+}
+
+// insertRequestLog inserts a request log record.
+func (l *ConversationLogger) insertRequestLog(
+	ctx context.Context,
+	conversationID string,
+	reqBody, respBody []byte,
+	method, url string,
+	statusCode int,
+	parsed *ParsedRequest,
+	requestID string,
+	durationMs int64,
+) error {
+	table := quoteID(l.schema) + ".request_log"
+
+	_, err := l.db.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO %s (conversation_id, request_method, request_url, request_body, response_status, response_body, model, stream, request_id, duration_ms)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10)
+	`, table),
+		conversationID, method, url, reqBody, statusCode, respBody,
+		parsed.Model, parsed.Stream, requestID, durationMs,
+	)
+	return err
+}
+
+// truncateBody truncates a body to the configured max size.
+func (l *ConversationLogger) truncateBody(body []byte) []byte {
+	if body == nil {
+		return nil
+	}
+	if l.cfg.MaxBodySize <= 0 || len(body) <= l.cfg.MaxBodySize {
+		return body
+	}
+	truncated := make([]byte, l.cfg.MaxBodySize)
+	copy(truncated, body[:l.cfg.MaxBodySize])
+	// Append truncation notice
+	notice := []byte("\n...[TRUNCATED]")
+	truncated = append(truncated[:l.cfg.MaxBodySize-len(notice)], notice...)
+	return truncated
+}
+
+// isModelExcluded checks if a model name matches any exclusion pattern.
+func (l *ConversationLogger) isModelExcluded(model string) bool {
+	for _, pattern := range l.cfg.ExcludeModels {
+		if matchModelPattern(model, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchModelPattern checks if a model name matches a pattern (supports * wildcard).
+func matchModelPattern(model, pattern string) bool {
+	if pattern == "*" {
+		return true
+	}
+	model = strings.ToLower(model)
+	pattern = strings.ToLower(pattern)
+
+	if strings.HasPrefix(pattern, "*") && strings.HasSuffix(pattern, "*") {
+		return strings.Contains(model, pattern[1:len(pattern)-1])
+	}
+	if strings.HasPrefix(pattern, "*") {
+		return strings.HasSuffix(model, pattern[1:])
+	}
+	if strings.HasSuffix(pattern, "*") {
+		return strings.HasPrefix(model, pattern[:len(pattern)-1])
+	}
+	return model == pattern
+}
+
+// isPathExcluded checks if a URL path matches any exclusion pattern.
+func (l *ConversationLogger) isPathExcluded(url string) bool {
+	for _, pattern := range l.cfg.ExcludePaths {
+		if strings.Contains(url, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// collectStreamingResponse collects streaming chunks and returns the assembled response.
+func collectStreamingResponse(chunks [][]byte) []byte {
+	if len(chunks) == 0 {
+		return nil
+	}
+	return bytes.Join(chunks, nil)
+}
