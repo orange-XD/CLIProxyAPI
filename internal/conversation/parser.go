@@ -30,6 +30,7 @@ type ParserRegistry struct {
 func NewParserRegistry() *ParserRegistry {
 	registry := &ParserRegistry{}
 	registry.Register(&OpenAIChatParser{})
+	registry.Register(&OpenAIResponseParser{})
 	return registry
 }
 
