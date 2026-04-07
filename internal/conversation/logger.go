@@ -285,6 +285,11 @@ func (l *ConversationLogger) writeConversation(
 		return fmt.Errorf("upsert conversation: %w", err)
 	}
 
+	// Clear existing messages for the conversation to handle updates
+	if err := l.clearMessagesByConversationID(ctx, conversationID); err != nil {
+		return fmt.Errorf("clear messages: %w", err)
+	}
+
 	// Insert request messages (with deduplication)
 	if err := l.insertMessages(ctx, conversationID, parsed.Messages); err != nil {
 		log.Debugf("conversation: insert request messages: %v", err)
@@ -365,6 +370,34 @@ func (l *ConversationLogger) insertMessages(ctx context.Context, conversationID 
 		if err != nil {
 			log.Debugf("conversation: insert message idx=%d role=%s: %v", msg.MsgIndex, msg.Role, err)
 		}
+	}
+
+	return nil
+}
+
+// clearMessagesByConversationID removes all stored messages for a conversation and resets its message count.
+func (l *ConversationLogger) clearMessagesByConversationID(ctx context.Context, conversationID string) error {
+	if strings.TrimSpace(conversationID) == "" {
+		return fmt.Errorf("conversation: conversationID is required")
+	}
+
+	messageTable := quoteID(l.schema) + ".conversation_message"
+
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	if _, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		DELETE FROM %s
+		WHERE conversation_id = $1
+	`, messageTable), conversationID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return err
 	}
 
 	return nil

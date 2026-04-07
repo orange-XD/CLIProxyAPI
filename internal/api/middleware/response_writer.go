@@ -13,7 +13,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
-	log "github.com/sirupsen/logrus"
 )
 
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
@@ -176,8 +175,6 @@ func (w *ResponseWriterWrapper) prepareResponse() {
 
 		contentType := w.ResponseWriter.Header().Get("Content-Type")
 		w.isStreaming = w.detectStreaming(contentType)
-
-		log.Debugf("	[ResponseWriterWrapper]: Detected streaming response: %v (Content-Type: %s, Status: %d)", w.isStreaming, contentType, w.statusCode)
 
 		if !w.isStreaming || w.logger == nil || !w.logger.IsEnabled() || w.requestInfo == nil {
 			return
