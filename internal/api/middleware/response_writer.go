@@ -187,7 +187,7 @@ func (w *ResponseWriterWrapper) prepareResponse() {
 			w.requestInfo.Body,
 			w.requestInfo.RequestID,
 		)
-		if err != nil {
+		if err != nil || streamWriter == nil {
 			return
 		}
 

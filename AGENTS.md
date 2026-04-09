@@ -40,6 +40,25 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - `sdk/cliproxy/` — Embeddable SDK entry (service/builder/watchers/pipeline)
 - `test/` — Cross-module integration tests
 
+## Request And Conversation Logging
+- Request logging middleware is attached in `internal/api/server.go` before CORS/auth middleware.
+- When `conversation-log.enabled` is true, `sdk/cliproxy/service.go` replaces the default file request logger with `internal/conversation/ConversationLogger`.
+- `internal/conversation/parser.go` currently registers only `OpenAIChatParser` and `OpenAIResponseParser`.
+- Conversation logging currently supports OpenAI-style routes only:
+  - `/v1/chat/completions`
+  - `/v1/responses`
+- Claude `/v1/messages` requests are not currently parsed by `ConversationLogger`, so they are skipped for conversation persistence.
+- `ConversationLogger.LogStreamingRequest(...)` may intentionally return `(nil, nil)` when:
+  - no parser matches the URL
+  - the request body cannot be parsed into a conversation
+  - the parsed conversation key is empty
+  - the model is excluded
+- `ResponseWriterWrapper.prepareResponse()` in `internal/api/middleware/response_writer.go` must treat a nil streaming writer as "skip streaming logging". It now guards `streamWriter == nil` before calling `WriteStatus(...)`.
+- Important distinction between logger implementations:
+  - `FileRequestLogger.LogStreamingRequest(...)` returns a no-op writer when logging is disabled
+  - `ConversationLogger.LogStreamingRequest(...)` can return `nil, nil` to mean "not applicable for this route/request"
+- Maintenance pitfall: if a request logger implementation can return a nil `StreamingLogWriter`, middleware must nil-guard before creating chunk channels or calling writer methods, otherwise streaming routes such as Claude `/v1/messages` can panic on first chunk write.
+
 ## Code Conventions
 - Keep changes small and simple (KISS)
 - Comments in English only
