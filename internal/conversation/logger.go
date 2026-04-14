@@ -202,10 +202,14 @@ func (l *ConversationLogger) LogRequest(
 
 	// Parse response messages
 	var responseMessages []UnifiedMessage
-	if len(apiResponse) > 0 {
-		responseMessages = parser.ParseResponse(apiResponse)
-	} else if len(response) > 0 {
-		responseMessages = parser.ParseResponse(response)
+	for _, candidate := range [][]byte{response, apiResponse} {
+		if len(candidate) == 0 {
+			continue
+		}
+		responseMessages = parser.ParseResponse(candidate)
+		if len(responseMessages) > 0 {
+			break
+		}
 	}
 
 	// Calculate duration
@@ -308,9 +312,9 @@ func (l *ConversationLogger) writeConversation(
 	}
 
 	// Insert request log
-	if err := l.insertRequestLog(ctx, conversationID, reqBody, respBody, method, url, statusCode, parsed, requestID, durationMs); err != nil {
-		log.Debugf("conversation: insert request log: %v", err)
-	}
+	// if err := l.insertRequestLog(ctx, conversationID, reqBody, respBody, method, url, statusCode, parsed, requestID, durationMs); err != nil {
+	// 	log.Debugf("conversation: insert request log: %v", err)
+	// }
 
 	return nil
 }

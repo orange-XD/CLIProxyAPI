@@ -1,9 +1,7 @@
 package conversation
 
 import (
-	"crypto/sha256"
 	"encoding/json"
-	"fmt"
 	"strings"
 )
 
@@ -206,14 +204,4 @@ func parseContent(raw json.RawMessage) (string, []ContentPart) {
 
 	// Fallback: return raw as string
 	return string(raw), nil
-}
-
-// deriveConversationKey generates a unique key from the first user message content
-// using SHA256 hash (first 16 bytes hex-encoded).
-func deriveConversationKey(content string) string {
-	if content == "" {
-		return ""
-	}
-	h := sha256.Sum256([]byte(content))
-	return fmt.Sprintf("%x", h[:16])
 }

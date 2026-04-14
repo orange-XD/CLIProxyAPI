@@ -134,10 +134,14 @@ func (w *ConversationStreamWriter) Close() error {
 
 	// Parse response messages from the assembled body
 	var responseMessages []UnifiedMessage
-	if len(apiResp) > 0 {
-		responseMessages = w.parser.ParseResponse(apiResp)
-	} else if len(respBody) > 0 {
-		responseMessages = w.parser.ParseResponse(respBody)
+	for _, candidate := range [][]byte{respBody, apiResp} {
+		if len(candidate) == 0 {
+			continue
+		}
+		responseMessages = w.parser.ParseResponse(candidate)
+		if len(responseMessages) > 0 {
+			break
+		}
 	}
 
 	// If still no parsed messages, try parsing the streaming SSE data

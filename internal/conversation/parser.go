@@ -31,6 +31,7 @@ func NewParserRegistry() *ParserRegistry {
 	registry := &ParserRegistry{}
 	registry.Register(&OpenAIChatParser{})
 	registry.Register(&OpenAIResponseParser{})
+	registry.Register(&ClaudeMessagesParser{})
 	return registry
 }
 
