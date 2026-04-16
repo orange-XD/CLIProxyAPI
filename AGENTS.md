@@ -43,16 +43,30 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 ## Request And Conversation Logging
 - Request logging middleware is attached in `internal/api/server.go` before CORS/auth middleware.
 - When `conversation-log.enabled` is true, `sdk/cliproxy/service.go` replaces the default file request logger with `internal/conversation/ConversationLogger`.
-- `internal/conversation/parser.go` currently registers only `OpenAIChatParser` and `OpenAIResponseParser`.
-- Conversation logging currently supports OpenAI-style routes only:
+- `internal/conversation/parser.go` currently registers `OpenAIChatParser`, `OpenAIResponseParser`, and `ClaudeMessagesParser`.
+- Conversation logging currently supports:
   - `/v1/chat/completions`
   - `/v1/responses`
-- Claude `/v1/messages` requests are not currently parsed by `ConversationLogger`, so they are skipped for conversation persistence.
+  - `/v1/messages`
+- Claude `/v1/messages/count_tokens` is not a conversation route and is intentionally excluded by `ClaudeMessagesParser.MatchURL(...)`.
+- `internal/conversation/conversation_key.go` contains the shared `deriveConversationKey(...)` helper used by all conversation parsers.
+- `ConversationLogger.writeConversation(...)` now persists a conversation turn inside a single SQL transaction: conversation upsert, existing message delete, and message re-insert must commit or roll back together.
+- `internal/conversation/logger.go` helpers `upsertConversation(...)`, `clearMessagesByConversationID(...)`, `insertMessages(...)`, and `insertRequestLog(...)` currently operate on `*sql.Tx`, not `*sql.DB`.
+- `insertMessages(...)` uses batched multi-row `INSERT ... VALUES ... ON CONFLICT DO NOTHING` statements (currently 500 messages per batch) to reduce per-message round trips during full conversation rewrites.
+- Claude conversation persistence currently stores the common subset of Anthropic message content:
+  - `text`
+  - `image`
+  - `tool_use`
+  - `tool_result`
+- Claude-specific blocks such as `thinking`, `redacted_thinking`, `signature`, and `cache_control` are not currently persisted in the unified conversation schema and may be dropped during parsing.
 - `ConversationLogger.LogStreamingRequest(...)` may intentionally return `(nil, nil)` when:
   - no parser matches the URL
   - the request body cannot be parsed into a conversation
   - the parsed conversation key is empty
   - the model is excluded
+- Response parsing prefers the actual downstream response body first (`response` / assembled SSE body), then falls back to `apiResponse`.
+- Maintenance pitfall: `apiResponse` may contain request-log wrapper text rather than a raw upstream JSON body, so parser logic must not assume `apiResponse` is always directly parseable.
+- Maintenance pitfall: do not split conversation upsert/delete/insert back into separate autocommit operations unless partial conversation rewrites are explicitly acceptable; the current transaction boundary prevents "messages cleared but not reinserted" states on failure.
 - `ResponseWriterWrapper.prepareResponse()` in `internal/api/middleware/response_writer.go` must treat a nil streaming writer as "skip streaming logging". It now guards `streamWriter == nil` before calling `WriteStatus(...)`.
 - Important distinction between logger implementations:
   - `FileRequestLogger.LogStreamingRequest(...)` returns a no-op writer when logging is disabled

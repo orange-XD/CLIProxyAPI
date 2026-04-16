@@ -38,6 +38,8 @@ type ConversationLogger struct {
 var _ logging.RequestLogger = (*ConversationLogger)(nil)
 var _ logging.StreamingLogWriter = (*ConversationStreamWriter)(nil)
 
+const messageInsertBatchSize = 500
+
 // writeOp represents an asynchronous database write operation.
 type writeOp struct {
 	fn   func(ctx context.Context) error
@@ -283,48 +285,61 @@ func (l *ConversationLogger) writeConversation(
 	durationMs int64,
 	responseMessages []UnifiedMessage,
 ) error {
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() {
+		if errRollback := tx.Rollback(); errRollback != nil && errRollback != sql.ErrTxDone {
+			log.Debugf("conversation: rollback transaction: %v", errRollback)
+		}
+	}()
+
 	// Upsert conversation
-	conversationID, err := l.upsertConversation(ctx, parsed)
+	conversationID, err := l.upsertConversation(ctx, tx, parsed)
 	if err != nil {
 		return fmt.Errorf("upsert conversation: %w", err)
 	}
 
 	// Clear existing messages for the conversation to handle updates
-	if err := l.clearMessagesByConversationID(ctx, conversationID); err != nil {
+	if err := l.clearMessagesByConversationID(ctx, tx, conversationID); err != nil {
 		return fmt.Errorf("clear messages: %w", err)
 	}
 
-	// Insert request messages (with deduplication)
-	if err := l.insertMessages(ctx, conversationID, parsed.Messages); err != nil {
-		log.Debugf("conversation: insert request messages: %v", err)
-	}
-
-	// Insert response messages (with deduplication)
+	allMessages := make([]UnifiedMessage, 0, len(parsed.Messages)+len(responseMessages))
+	allMessages = append(allMessages, parsed.Messages...)
 	if len(responseMessages) > 0 {
 		// Re-index response messages starting after the last request message
 		offset := len(parsed.Messages)
-		for i := range responseMessages {
-			responseMessages[i].MsgIndex = offset + i
-		}
-		if err := l.insertMessages(ctx, conversationID, responseMessages); err != nil {
-			log.Debugf("conversation: insert response messages: %v", err)
+		for i, msg := range responseMessages {
+			msg.MsgIndex = offset + i
+			allMessages = append(allMessages, msg)
 		}
 	}
 
+	// Insert request/response messages with deduplication.
+	if err := l.insertMessages(ctx, tx, conversationID, allMessages); err != nil {
+		return fmt.Errorf("insert messages: %w", err)
+	}
+
 	// Insert request log
-	// if err := l.insertRequestLog(ctx, conversationID, reqBody, respBody, method, url, statusCode, parsed, requestID, durationMs); err != nil {
+	// if err := l.insertRequestLog(ctx, tx, conversationID, reqBody, respBody, method, url, statusCode, parsed, requestID, durationMs); err != nil {
 	// 	log.Debugf("conversation: insert request log: %v", err)
 	// }
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
 
 	return nil
 }
 
 // upsertConversation creates or retrieves a conversation by conversation_key.
-func (l *ConversationLogger) upsertConversation(ctx context.Context, parsed *ParsedRequest) (string, error) {
+func (l *ConversationLogger) upsertConversation(ctx context.Context, tx *sql.Tx, parsed *ParsedRequest) (string, error) {
 	table := quoteID(l.schema) + ".conversation"
 
 	var id string
-	err := l.db.QueryRowContext(ctx, fmt.Sprintf(`
+	err := tx.QueryRowContext(ctx, fmt.Sprintf(`
 		INSERT INTO %s (conversation_key, model, api_type, updated_at, message_count)
 		VALUES ($1, $2, $3, NOW(), $4)
 		ON CONFLICT (conversation_key) DO UPDATE SET
@@ -340,39 +355,22 @@ func (l *ConversationLogger) upsertConversation(ctx context.Context, parsed *Par
 }
 
 // insertMessages inserts messages with ON CONFLICT DO NOTHING for deduplication.
-func (l *ConversationLogger) insertMessages(ctx context.Context, conversationID string, messages []UnifiedMessage) error {
+func (l *ConversationLogger) insertMessages(ctx context.Context, tx *sql.Tx, conversationID string, messages []UnifiedMessage) error {
 	if len(messages) == 0 {
 		return nil
 	}
 
 	table := quoteID(l.schema) + ".conversation_message"
 
-	// Prepare content_json for complex content
-	for _, msg := range messages {
-		contentJSON := ""
-		if len(msg.ContentParts) > 0 {
-			if data, err := json.Marshal(msg.ContentParts); err == nil {
-				contentJSON = string(data)
-			}
+	for start := 0; start < len(messages); start += messageInsertBatchSize {
+		end := start + messageInsertBatchSize
+		if end > len(messages) {
+			end = len(messages)
 		}
 
-		toolCallsJSON := ""
-		if len(msg.ToolCalls) > 0 {
-			if data, err := json.Marshal(msg.ToolCalls); err == nil {
-				toolCallsJSON = string(data)
-			}
-		}
-
-		_, err := l.db.ExecContext(ctx, fmt.Sprintf(`
-			INSERT INTO %s (conversation_id, msg_index, source, role, content, content_json, tool_calls_json, tool_call_id, name)
-			VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($7, ''), NULLIF($8, ''), NULLIF($9, ''))
-			ON CONFLICT (conversation_id, msg_index, source) DO NOTHING
-		`, table),
-			conversationID, msg.MsgIndex, msg.Source, string(msg.Role),
-			msg.Content, contentJSON, toolCallsJSON, msg.ToolCallID, msg.Name,
-		)
-		if err != nil {
-			log.Debugf("conversation: insert message idx=%d role=%s: %v", msg.MsgIndex, msg.Role, err)
+		query, args := buildInsertMessagesQuery(table, conversationID, messages[start:end])
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			return err
 		}
 	}
 
@@ -380,27 +378,17 @@ func (l *ConversationLogger) insertMessages(ctx context.Context, conversationID 
 }
 
 // clearMessagesByConversationID removes all stored messages for a conversation and resets its message count.
-func (l *ConversationLogger) clearMessagesByConversationID(ctx context.Context, conversationID string) error {
+func (l *ConversationLogger) clearMessagesByConversationID(ctx context.Context, tx *sql.Tx, conversationID string) error {
 	if strings.TrimSpace(conversationID) == "" {
 		return fmt.Errorf("conversation: conversationID is required")
 	}
 
 	messageTable := quoteID(l.schema) + ".conversation_message"
 
-	tx, err := l.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-
-	if _, err = tx.ExecContext(ctx, fmt.Sprintf(`
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		DELETE FROM %s
 		WHERE conversation_id = $1
 	`, messageTable), conversationID); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-
-	if err = tx.Commit(); err != nil {
 		return err
 	}
 
@@ -410,6 +398,7 @@ func (l *ConversationLogger) clearMessagesByConversationID(ctx context.Context, 
 // insertRequestLog inserts a request log record.
 func (l *ConversationLogger) insertRequestLog(
 	ctx context.Context,
+	tx *sql.Tx,
 	conversationID string,
 	reqBody, respBody []byte,
 	method, url string,
@@ -420,7 +409,7 @@ func (l *ConversationLogger) insertRequestLog(
 ) error {
 	table := quoteID(l.schema) + ".request_log"
 
-	_, err := l.db.ExecContext(ctx, fmt.Sprintf(`
+	_, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		INSERT INTO %s (conversation_id, request_method, request_url, request_body, response_status, response_body, model, stream, request_id, duration_ms)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''), $10)
 	`, table),
@@ -492,4 +481,80 @@ func collectStreamingResponse(chunks [][]byte) []byte {
 		return nil
 	}
 	return bytes.Join(chunks, nil)
+}
+
+func buildInsertMessagesQuery(table string, conversationID string, messages []UnifiedMessage) (string, []any) {
+	args := make([]any, 0, len(messages)*9)
+	var builder strings.Builder
+
+	builder.WriteString(`
+			INSERT INTO `)
+	builder.WriteString(table)
+	builder.WriteString(` (conversation_id, msg_index, source, role, content, content_json, tool_calls_json, tool_call_id, name)
+			VALUES `)
+
+	for i, msg := range messages {
+		if i > 0 {
+			builder.WriteString(", ")
+		}
+
+		placeholderStart := i*9 + 1
+		builder.WriteString(fmt.Sprintf(
+			"($%d, $%d, $%d, $%d, $%d, NULLIF($%d, ''), NULLIF($%d, ''), NULLIF($%d, ''), NULLIF($%d, ''))",
+			placeholderStart,
+			placeholderStart+1,
+			placeholderStart+2,
+			placeholderStart+3,
+			placeholderStart+4,
+			placeholderStart+5,
+			placeholderStart+6,
+			placeholderStart+7,
+			placeholderStart+8,
+		))
+
+		args = append(
+			args,
+			conversationID,
+			msg.MsgIndex,
+			msg.Source,
+			string(msg.Role),
+			msg.Content,
+			marshalContentParts(msg.ContentParts),
+			marshalToolCalls(msg.ToolCalls),
+			msg.ToolCallID,
+			msg.Name,
+		)
+	}
+
+	builder.WriteString(`
+			ON CONFLICT (conversation_id, msg_index, source) DO NOTHING
+		`)
+
+	return builder.String(), args
+}
+
+func marshalContentParts(parts []ContentPart) string {
+	if len(parts) == 0 {
+		return ""
+	}
+
+	data, err := json.Marshal(parts)
+	if err != nil {
+		return ""
+	}
+
+	return string(data)
+}
+
+func marshalToolCalls(toolCalls []ToolCall) string {
+	if len(toolCalls) == 0 {
+		return ""
+	}
+
+	data, err := json.Marshal(toolCalls)
+	if err != nil {
+		return ""
+	}
+
+	return string(data)
 }
