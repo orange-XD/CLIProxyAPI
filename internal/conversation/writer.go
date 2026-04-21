@@ -19,6 +19,7 @@ type ConversationStreamWriter struct {
 	url       string
 	requestID string
 	startTime time.Time
+	clientIP  string
 
 	mu                   sync.Mutex
 	chunks               [][]byte
@@ -115,6 +116,7 @@ func (w *ConversationStreamWriter) Close() error {
 	requestID := w.requestID
 	startTime := w.startTime
 	firstChunk := w.firstChunk
+	clientIP := w.clientIP
 	w.mu.Unlock()
 
 	// Assemble raw streaming response body
@@ -157,7 +159,7 @@ func (w *ConversationStreamWriter) Close() error {
 
 	// Enqueue async write
 	w.logger.enqueueWrite(func(ctx context.Context) error {
-		return w.logger.writeConversation(ctx, parsed, reqBody, respBodyToLog, method, url, status, requestID, durationMs, responseMessages)
+		return w.logger.writeConversation(ctx, parsed, reqBody, respBodyToLog, method, url, status, requestID, durationMs, responseMessages, clientIP)
 	})
 
 	return nil

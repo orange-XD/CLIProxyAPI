@@ -124,6 +124,8 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 	for key, values := range c.Request.Header {
 		headers[key] = values
 	}
+	// Inject client IP for downstream loggers (e.g. conversation IP tracking)
+	headers["X-Internal-Client-IP"] = []string{c.ClientIP()}
 
 	// Capture request body
 	var body []byte

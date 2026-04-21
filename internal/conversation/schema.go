@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS %s.conversation (
     api_type        TEXT    NOT NULL DEFAULT '',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    message_count   INTEGER NOT NULL DEFAULT 0
+    message_count   INTEGER NOT NULL DEFAULT 0,
+    client_ip       TEXT    NOT NULL DEFAULT '',
+    request_count   INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_key ON %s.conversation (conversation_key);
 `
@@ -88,6 +90,16 @@ func EnsureSchema(ctx context.Context, db *sql.DB, schema string) error {
 	q := fmt.Sprintf(ddlConversation, quoteID(schema), quoteID(schema))
 	if _, err := db.ExecContext(ctx, q); err != nil {
 		return fmt.Errorf("conversation: create conversation table: %w", err)
+	}
+
+	// Ensure backward-compatible columns for conversation table
+	conversationTable := quoteID(schema) + "." + quoteID("conversation")
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(`
+		ALTER TABLE %s
+		ADD COLUMN IF NOT EXISTS client_ip TEXT NOT NULL DEFAULT '',
+		ADD COLUMN IF NOT EXISTS request_count INTEGER NOT NULL DEFAULT 0
+	`, conversationTable)); err != nil {
+		return fmt.Errorf("conversation: add conversation columns: %w", err)
 	}
 
 	q = fmt.Sprintf(ddlConversationMessage, quoteID(schema), quoteID(schema), quoteID(schema))

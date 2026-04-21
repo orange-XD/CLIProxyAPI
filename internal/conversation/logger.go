@@ -220,9 +220,11 @@ func (l *ConversationLogger) LogRequest(
 		durationMs = apiResponseTimestamp.Sub(requestTimestamp).Milliseconds()
 	}
 
+	clientIP := extractClientIP(requestHeaders)
+
 	// Enqueue async write
 	l.enqueueWrite(func(ctx context.Context) error {
-		return l.writeConversation(ctx, parsed, reqBody, respBody, method, url, statusCode, requestID, durationMs, responseMessages)
+		return l.writeConversation(ctx, parsed, reqBody, respBody, method, url, statusCode, requestID, durationMs, responseMessages, clientIP)
 	})
 
 	return nil
@@ -259,6 +261,8 @@ func (l *ConversationLogger) LogStreamingRequest(
 	}
 	reqBody = l.truncateBody(reqBody)
 
+	clientIP := extractClientIP(headers)
+
 	writer := &ConversationStreamWriter{
 		logger:    l,
 		parser:    parser,
@@ -269,6 +273,7 @@ func (l *ConversationLogger) LogStreamingRequest(
 		requestID: requestID,
 		startTime: time.Now(),
 		chunks:    make([][]byte, 0, 64),
+		clientIP:  clientIP,
 	}
 
 	return writer, nil
@@ -284,6 +289,7 @@ func (l *ConversationLogger) writeConversation(
 	requestID string,
 	durationMs int64,
 	responseMessages []UnifiedMessage,
+	clientIP string,
 ) error {
 	tx, err := l.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -296,7 +302,7 @@ func (l *ConversationLogger) writeConversation(
 	}()
 
 	// Upsert conversation
-	conversationID, err := l.upsertConversation(ctx, tx, parsed)
+	conversationID, err := l.upsertConversation(ctx, tx, parsed, clientIP)
 	if err != nil {
 		return fmt.Errorf("upsert conversation: %w", err)
 	}
@@ -335,19 +341,21 @@ func (l *ConversationLogger) writeConversation(
 }
 
 // upsertConversation creates or retrieves a conversation by conversation_key.
-func (l *ConversationLogger) upsertConversation(ctx context.Context, tx *sql.Tx, parsed *ParsedRequest) (string, error) {
+func (l *ConversationLogger) upsertConversation(ctx context.Context, tx *sql.Tx, parsed *ParsedRequest, clientIP string) (string, error) {
 	table := quoteID(l.schema) + ".conversation"
 
 	var id string
 	err := tx.QueryRowContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (conversation_key, model, api_type, updated_at, message_count)
-		VALUES ($1, $2, $3, NOW(), $4)
+		INSERT INTO %s (conversation_key, model, api_type, updated_at, message_count, client_ip, request_count)
+		VALUES ($1, $2, $3, NOW(), $4, $5, 1)
 		ON CONFLICT (conversation_key) DO UPDATE SET
 			model = EXCLUDED.model,
 			updated_at = NOW(),
-			message_count = EXCLUDED.message_count
+			message_count = EXCLUDED.message_count,
+			client_ip = EXCLUDED.client_ip,
+			request_count = %s.request_count + 1
 		RETURNING id
-	`, table), parsed.ConversationKey, parsed.Model, parsed.APIType, len(parsed.Messages)).Scan(&id)
+	`, table, table), parsed.ConversationKey, parsed.Model, parsed.APIType, len(parsed.Messages), clientIP).Scan(&id)
 	if err != nil {
 		return "", err
 	}
@@ -393,6 +401,14 @@ func (l *ConversationLogger) clearMessagesByConversationID(ctx context.Context, 
 	}
 
 	return nil
+}
+
+// extractClientIP extracts the client IP from request headers.
+func extractClientIP(headers map[string][]string) string {
+	if values, ok := headers["X-Internal-Client-IP"]; ok && len(values) > 0 {
+		return values[0]
+	}
+	return ""
 }
 
 // insertRequestLog inserts a request log record.
