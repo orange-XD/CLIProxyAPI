@@ -53,6 +53,11 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 - `ConversationLogger.writeConversation(...)` now persists a conversation turn inside a single SQL transaction: conversation upsert, existing message delete, and message re-insert must commit or roll back together.
 - `internal/conversation/logger.go` helpers `upsertConversation(...)`, `clearMessagesByConversationID(...)`, `insertMessages(...)`, and `insertRequestLog(...)` currently operate on `*sql.Tx`, not `*sql.DB`.
 - `insertMessages(...)` uses batched multi-row `INSERT ... VALUES ... ON CONFLICT DO NOTHING` statements (currently 500 messages per batch) to reduce per-message round trips during full conversation rewrites.
+- `internal/conversation/schema.go` uses `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` after `CREATE TABLE` to keep schema backward-compatible across deployments with mixed old/new code.
+- `conversation` table tracks `client_ip` (latest request IP) and `request_count` (total request count per conversation key):
+  - `upsertConversation(...)` inserts with `request_count = 1` and updates `client_ip` on conflict, incrementing `request_count = conversation.request_count + 1`.
+  - Client IP is extracted via `extractClientIP(...)` from the `X-Internal-Client-IP` header injected by `RequestLoggingMiddleware`.
+  - Both streaming and non-streaming paths pass the IP through to `writeConversation(...)`.
 - Claude conversation persistence currently stores the common subset of Anthropic message content:
   - `text`
   - `image`
