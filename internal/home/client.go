@@ -28,6 +28,7 @@ const (
 	redisKeyModels     = "models"
 	redisKeyUsage      = "usage"
 	redisKeyRequestLog = "request-log"
+	redisKeyAppLog     = "app-log"
 
 	homeReconnectInterval          = time.Second
 	homeReconnectFailoverThreshold = 3
@@ -180,7 +181,6 @@ func (c *Client) redisOptionsLocked(addr string) (*redis.Options, error) {
 	}
 	return &redis.Options{
 		Addr:                  addr,
-		Password:              c.homeCfg.Password,
 		TLSConfig:             tlsConfig,
 		DialTimeout:           homeRedisOperationTimeout,
 		ReadTimeout:           homeRedisOperationTimeout,
@@ -649,6 +649,17 @@ func (c *Client) RPushRequestLog(ctx context.Context, payload []byte) error {
 		return nil
 	}
 	return cmd.RPush(ctx, redisKeyRequestLog, payload).Err()
+}
+
+func (c *Client) RPushAppLog(ctx context.Context, payload []byte) error {
+	cmd, errClient := c.commandClient()
+	if errClient != nil {
+		return errClient
+	}
+	if len(payload) == 0 {
+		return nil
+	}
+	return cmd.RPush(ctx, redisKeyAppLog, payload).Err()
 }
 
 func (c *Client) handleSubscriptionPayload(channel string, payload string, onConfig func([]byte) error) error {
